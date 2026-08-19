@@ -20,11 +20,7 @@ The cue dictionary and tag-injection logic referenced in the paper are in
 
 ## Setup
 
-Python 3.10+.
-
-```bash
-pip install -r requirements.txt
-```
+Python 3.10+. Install the dependencies imported at the top of the scripts.
 
 ## Data format
 
