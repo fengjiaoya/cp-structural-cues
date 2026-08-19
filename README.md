@@ -41,7 +41,3 @@ python OurRoBERTa.py --csv_path data/annotated_data.csv --use_struct_tags on  # 
 ```
 
 Use `-h` on any script to see all options.
-
-## License
-
-MIT — see `LICENSE`.
