@@ -14,7 +14,6 @@ Integration, Resolution, and Non-CP (`Other` in the code/data).
 | `cue_dictionary.py` | The cue dictionary (**42 regex rules → 36 structural tags**) and tag-injection functions. |
 | `RoBERTa.py`, `BERT.py` | Baseline classifiers (no cues). |
 | `OurRoBERTa.py`, `OurBERT.py` | Classifiers **with structural cues** (primary model: `OurRoBERTa.py`). |
-| `data/annotated_data.sample.csv` | Sample showing the input format (synthetic rows). |
 
 The cue dictionary and tag-injection logic referenced in the paper are in
 `cue_dictionary.py`. Inspect it directly with `python cue_dictionary.py`.
