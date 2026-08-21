@@ -1,0 +1,874 @@
+# Requirements:
+# pip install -U transformers datasets accelerate scikit-learn pandas numpy evaluate shap
+
+import os, json, argparse, numpy as np, pandas as pd, re
+from collections import Counter
+
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import f1_score, accuracy_score, precision_recall_curve, average_precision_score, precision_recall_fscore_support, classification_report, cohen_kappa_score
+from sklearn.preprocessing import label_binarize
+from sklearn.utils.class_weight import compute_class_weight
+
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from datasets import Dataset, DatasetDict
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    TrainingArguments, Trainer, EarlyStoppingCallback, DataCollatorWithPadding,
+    BitsAndBytesConfig
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import evaluate
+from dataclasses import replace
+from datetime import datetime
+
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# ------------------------- Utilities -------------------------
+def set_seed_all(seed=42):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def stable_softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x, axis=1, keepdims=True)
+    ex = np.exp(x)
+    return ex / np.sum(ex, axis=1, keepdims=True)
+
+def macro_auprc(y_true: np.ndarray, probas: np.ndarray, num_labels: int) -> float:
+    y_bin = label_binarize(y_true, classes=np.arange(num_labels))
+    ap = []
+    for c in range(num_labels):
+        ap.append(average_precision_score(y_bin[:, c], probas[:, c]))
+    return float(np.mean(ap))
+
+def recall_at_precision(y_true: np.ndarray, probas: np.ndarray, p_thresh: float, num_labels: int):
+    """Return (per_class_recalls, macro_recall) at max recall s.t. precision>=p_thresh (one-vs-rest)."""
+    y_bin = label_binarize(y_true, classes=np.arange(num_labels))
+    per_class = []
+    for c in range(num_labels):
+        precision, recall, _ = precision_recall_curve(y_bin[:, c], probas[:, c])
+        mask = precision >= p_thresh
+        r = float(np.max(recall[mask])) if np.any(mask) else 0.0
+        per_class.append(r)
+    return per_class, float(np.mean(per_class))
+
+def find_thresholds_for_precision(y_true: np.ndarray, probas: np.ndarray, p_thresh: float, num_labels: int):
+    """Return per-class probability thresholds that maximize recall while precision>=p_thresh."""
+    y_bin = label_binarize(y_true, classes=np.arange(num_labels))
+    thr_vec = np.full(num_labels, 1.01, dtype=float)  # default >1 => never predict that class
+    for c in range(num_labels):
+        precision, recall, thr = precision_recall_curve(y_bin[:, c], probas[:, c])
+        best_r, best_t = 0.0, 1.01
+        for i in range(1, len(precision)):  # align thresholds from index 1
+            if precision[i] >= p_thresh and recall[i] > best_r:
+                best_r, best_t = recall[i], float(thr[i-1])
+        thr_vec[c] = best_t
+    return thr_vec
+
+# === NEW: helper to export the best checkpoint (with fallback scan) ===
+# === REPLACE: robust exporter that prefers saving in-memory best model ===
+def export_best_from_trainer(
+    trainer: Trainer,
+    ds_val,
+    export_dir: str,
+    tokenizer,
+    num_labels: int,
+    p_thresh: float,
+    id2label: dict = None,
+    label2id: dict = None,
+):
+    import re
+    os.makedirs(export_dir, exist_ok=True)
+
+    if getattr(trainer.args, "load_best_model_at_end", False) and getattr(trainer.state, "best_model_checkpoint", None):
+        trainer.save_model(export_dir)          
+        tokenizer.save_pretrained(export_dir)
+        if id2label:
+            with open(os.path.join(export_dir, "id2label.json"), "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in id2label.items()}, f, ensure_ascii=False, indent=2)
+        return
+
+    run_dir = trainer.args.output_dir
+    ckpts = [os.path.join(run_dir, d) for d in os.listdir(run_dir) if re.match(r"checkpoint-\d+", d)]
+
+    ckpts.sort(key=lambda p: int(p.split("-")[-1]))  
+
+    if not ckpts:
+        trainer.save_model(export_dir)
+        tokenizer.save_pretrained(export_dir)
+        if id2label:
+            with open(os.path.join(export_dir, "id2label.json"), "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in id2label.items()}, f, ensure_ascii=False, indent=2)
+        return
+
+    def _load_model(ck_dir):
+        return AutoModelForSequenceClassification.from_pretrained(
+            ck_dir,
+            num_labels=num_labels,
+            id2label=id2label if id2label else None,
+            label2id=label2id if label2id else None,
+        )
+
+    def _score_model(ck_dir):
+        tmp_model = _load_model(ck_dir)
+        tmp_trainer = Trainer(
+            model=tmp_model,
+            args=TrainingArguments(
+                output_dir=os.path.join(run_dir, "_tmp_eval"),
+                per_device_eval_batch_size=max(2 * trainer.args.per_device_train_batch_size, 32),
+            ),
+        )
+        out = tmp_trainer.predict(ds_val)
+        probas = stable_softmax(out.predictions)
+        _, r_macro = recall_at_precision(out.label_ids, probas, p_thresh, num_labels)
+        return float(r_macro)
+
+    best_ck, best_val = None, -1.0
+    for ck in ckpts:
+        try:
+            val = _score_model(ck)
+        except Exception as e:
+            print(f"[WARN] scoring {ck} failed: {e}")
+            continue
+        if val > best_val:
+            best_val, best_ck = val, ck
+
+
+    if best_ck is None:
+        trainer.save_model(export_dir)
+        tokenizer.save_pretrained(export_dir)
+    else:
+        best_model = _load_model(best_ck)
+        best_model.save_pretrained(export_dir)
+        tokenizer.save_pretrained(export_dir)
+
+    if id2label:
+        with open(os.path.join(export_dir, "id2label.json"), "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in id2label.items()}, f, ensure_ascii=False, indent=2)
+
+
+
+# ------------------------- Lightweight Structural Cues -------------------------
+# Maps "Cognitive Presence" features to (regex, TAG) pairs.
+# Case-insensitive; word boundaries used to reduce false positives.
+
+CUE_PATTERNS = [
+    # ===== Generic (keep your originals) =====
+    (r"\b(because|since|as|due to|in order to)\b", "[CAUSE]"),
+    (r"\b(therefore|thus|so|hence|consequently|for this reason|as a result)\b", "[RESULT]"),
+    (r"\b(if|provided that|assuming|suppose|supposing|in case)\b", "[CONDITION]"),
+    (r"\b(but|however|nevertheless|nonetheless|yet|although|whereas|while)\b", "[CONTRAST]"),
+    (r"\b(for example|for instance|e\.g\.)\b", "[EXAMPLE]"),
+    (r"\?$", "[QUESTION]"),
+    (r"\b(should|must|need to|let'?s|have to|it's important to)\b", "[ACTION]"),
+    (r"\b(in conclusion|to (sum|summarize) up|overall|finally|in other words|taken together)\b", "[SUMMARY]"),
+    (r"\b(what|why|how|when|where|who)\b", "[INTERROG]"),
+
+    # ===== Triggering Event (problem recognition / awareness of inequity) =====
+    (r"\b(ask|asked|asking|wonder|wondered|question|questioned|notice|noticed|identify|identified|recognize|recognized)\b", "[TRIGGER]"),
+    (r"\b(i (am|’m|'m) (not sure|unsure|uncertain)|i (wonder|don'?t understand|do not understand))\b", "[UNCERTAINTY]"),
+    (r"\b(not|never|cannot|can'?t|unsure|unclear|confusing|uncertainty)\b", "[UNCERTAINTY]"),
+    (r"\b(tension\b|conflict( of interest)?|ethical dilemma)\b", "[CONFLICT]"),
+    (r"\b(unfair|inequit(y|able)|discriminat(e|ion|ory))\b", "[JUSTICE]"),
+    (r"\b(problem|issue|barrier|challenge|risk|concern|limitation|need|shortage)\b", "[PROBLEM]"),
+    (r"\b(lack of|there is no\b|missing (resources?|support))\b", "[LACK]"),
+    (r"\b(this (case|article) (raises|presents) (a|the) question)\b", "[TRIGGER]"),
+    (r"\b(i was surprised|it bothers me|i'?m shocked|i am shocked)\b", "[AFFECT]"),
+
+    # ===== Exploration (info exchange / tentative reasoning / perspective-taking) =====
+    (r"\b(might|could|may|should|would|perhaps|possibly|likely|maybe|appears to)\b", "[HEDGE]"),
+    (r"\b(also|in addition|moreover|furthermore)\b", "[ADD]"),
+    (r"\b(according to|the (article|paper|study) (states|shows)|research (shows|suggests)|data (show|suggest))\b", "[EVIDENCE]"),
+    (r"\b(i think|i believe|in my opinion|from my experience|i noticed that)\b", "[REFLECTION]"),
+    (r"\b(i can understand|it makes me feel|this (story|case) shows)\b", "[EMPATHY]"),
+    (r"\b(perhaps .* indicates|maybe .* (is|means))", "[SPECULATE]"),
+    # Soft phase tag if exploratory cues appear anywhere in the sentence
+    (r".*\b( if|suppose|assuming|might|could|may|perhaps|possibly|also|in addition|because )\b.*", "[EXPLORE]"),
+
+    # ===== Integration (connecting / synthesis / constructing meaning) =====
+    (r"\b(connects?|relates?|ties?|aligns?|bridges?|integrates?|synthesiz(e|es|ing))\b", "[INTEGRATE]"),
+    (r"\b(on (both )?the micro.*macro|individual (and|vs) (system|structural))\b", "[SYNTHESIS]"),
+    (r"\b(in other words|taken together|overall|this suggests that)\b", "[SYNTHESIS]"),
+    (r"\b(while .* is true,? .* also (matters|holds))\b", "[BALANCE]"),
+    (r"\b(the key idea is|the broader theme (involves|is))\b", "[ABSTRACT]"),
+    (r"\b(as a group we see|our discussion shows|building on (others'|other) (ideas|posts))\b", "[GROUP]"),
+    # Soft phase tag when causal/synthesis connectors appear
+    (r".*\b(therefore|thus|hence|connects?|integrates?|synthesiz(e|es))\b.*", "[INTEGRATE]"),
+
+    # ===== Resolution (application / decision / advocacy / action) =====
+    (r"\b(should|must|need to|let'?s|have to|it'?s important to|we ought to)\b", "[DIRECTIVE]"),
+    (r"\b(will|plan to|planning to|going to|aim to|next step|moving forward)\b", "[FUTURE]"),
+    (r"\b(apply|implement|advocate|intervene|empower|support|educate|reform|protect|collaborate|evaluate)\b", "[ACTION]"),
+    (r"\b(agency|organization|policy|community|legislation|practice)\b", "[POLICY]"),
+    (r"\b(proved effective|data show improvement|improved outcomes?)\b", "[EVALUATION]"),
+    (r"\b(this case taught me|i learned that|reminded me why)\b", "[LEARNING]"),
+    (r"\b(change|transform|reform|decolonize|humanize|equitable|equity)\b", "[JUSTICE]"),
+    (r"\b(we could apply|this model can be used for|in my agency we could)\b", "[IMPLEMENT]"),
+    (r"\b(we must ensure (equity|justice)|social workers should advocate)\b", "[ADVOCACY]"),
+    # Soft phase tag when directive/future/implementation cues appear
+    (r".*\b(should|must|need to|plan to|apply|implement|advocate|next step)\b.*", "[RESOLVE]"),
+]
+
+# Compile once (case-insensitive)
+import re
+CUE_REGEX = [(re.compile(p, flags=re.IGNORECASE), tag) for p, tag in CUE_PATTERNS]
+
+def structural_tags(text: str):
+    """Return a sorted set of tags detected in the text based on regex cues."""
+    if not isinstance(text, str):
+        return []
+    tags = set()
+    for rx, tag in CUE_REGEX:
+        if rx.search(text):
+            tags.add(tag)
+    return sorted(tags)
+
+def add_tags_to_text(text: str, pos: str = "prepend"):
+    """Inject tags into the text (prepend or append)."""
+    tags = " ".join(structural_tags(text))
+    if not tags:
+        return text
+    return (tags + " " + text) if pos == "prepend" else (text + " " + tags)
+
+
+# ------------------------- Custom Trainer -------------------------
+class WeightedTrainer(Trainer):
+    """
+    Accepts class_weights in __init__ and uses them in CrossEntropyLoss.
+    Also overrides get_train_dataloader to use WeightedRandomSampler conditionally.
+    """
+    def __init__(self, *args, class_weights=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights  # torch.Tensor or None
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        weight = None
+        if self.class_weights is not None:
+            weight = self.class_weights.to(device=logits.device, dtype=logits.dtype)
+
+        loss_fct = nn.CrossEntropyLoss(weight=weight)
+        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+    def get_train_dataloader(self):
+        if not getattr(self.args, "use_sampler", False):
+            return super().get_train_dataloader()
+
+        ds_train = self.train_dataset
+        labels = np.array(ds_train["label"])
+        bincount = np.bincount(labels, minlength=int(labels.max())+1)
+        sample_weights = 1.0 / np.maximum(bincount[labels], 1)
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.float),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        return DataLoader(
+            ds_train,
+            batch_size=self.args.train_batch_size,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+# ------------------------- Main -------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+    "--imbalance_mode",
+    type=str,
+    choices=["sampler", "loss", "both", "none"],
+    default="sampler",
+    help="How to handle class imbalance: sampler (default), loss, both, or none"
+)
+
+     # Data
+    ap.add_argument("--csv_path", type=str, default="data/annotated_data.csv")
+    ap.add_argument("--text_col", type=str, default="sentence")
+    ap.add_argument("--label_col", type=str, default="consensus_category")
+
+    # CV/Test config
+    ap.add_argument("--test_size", type=float, default=0.20)   # 20% independent Test
+    ap.add_argument("--kfolds", type=int, default=5)           # 5-fold CV on remaining 80%
+    ap.add_argument("--p_thresh", type=float, default=0.90)    # target precision threshold
+
+    # Model
+    ap.add_argument("--model_name", type=str, default="roberta-base")
+    ap.add_argument("--max_length", type=int, default=256)
+
+    # LoRA / Quantization
+    ap.add_argument("--use_lora", type=str, choices=["off","on"], default="on")
+    ap.add_argument("--lora_r", type=int, default=16) 
+    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument("--quantize", type=str, choices=["none","8bit"], default="none")
+
+    # Training
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--lr", type=float, default=2e-4)          # LoRA-stable default
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--grad_accum", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--fp16", type=str, default="false")
+
+    # Imbalance
+    ap.add_argument("--class_weight", type=str, choices=["off","on"], default="on")
+
+    # Early stopping / best metric (aligned to high-confidence objective)
+    ap.add_argument("--early_stop", type=str, choices=["off","on"], default="on")
+    ap.add_argument("--early_patience", type=int, default=3)  # LoRA-stable default
+
+    # Output
+    ap.add_argument("--output_dir", type=str, default="./runs/roberta_cv5_test20")
+    ap.add_argument("--save_merged", type=str, choices=["off","on"], default="on")
+
+    # === NEW/UPDATED ===:
+    ap.add_argument("--use_struct_tags", type=str, choices=["off","on"], default="on")
+    ap.add_argument("--struct_pos", type=str, choices=["prepend","append"], default="prepend")
+    ap.add_argument("--export_tag_summary", type=str, choices=["off","on"], default="on")
+    ap.add_argument("--shap_sample", type=int, default=0)  
+    args = ap.parse_args()
+
+    
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _base_out = args.output_dir
+    # Each run goes into a timestamped subfolder under the chosen output_dir
+    args.output_dir = os.path.join(_base_out, f"run_{run_stamp}")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # (Optional) keep a "latest" pointer for convenience on UNIX-like systems
+    try:
+        latest_link = os.path.join(_base_out, "latest")
+        if os.path.islink(latest_link) or os.path.exists(latest_link):
+            try:
+                os.remove(latest_link)
+            except IsADirectoryError:
+                pass
+        os.symlink(args.output_dir, latest_link)
+    except Exception:
+        # Symlink may fail on some filesystems/OS; it's safe to ignore
+        pass
+
+    # Record where this run went
+    with open(os.path.join(args.output_dir, "RUN_INFO.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Base output_dir: {_base_out}\n")
+        f.write(f"Run folder: {args.output_dir}\n")
+        f.write(f"Timestamp: {run_stamp}\n")
+
+    set_seed_all(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    use_cuda = torch.cuda.is_available()
+# Add this block immediately below
+    imbalance_mode   = getattr(args, "imbalance_mode", "sampler")
+    use_struct_tags  = getattr(args, "use_struct_tags", "on")
+    struct_pos       = getattr(args, "struct_pos", "prepend")
+    export_tag_sum   = getattr(args, "export_tag_summary", "on")
+    shap_sample      = getattr(args, "shap_sample", 0)
+
+    set_seed_all(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    use_cuda = torch.cuda.is_available()
+    # ------------------------- Load data -------------------------
+    df = pd.read_csv(args.csv_path)
+    df = df[[args.text_col, args.label_col]].dropna().drop_duplicates()
+    # Label mapping
+    labels_sorted = sorted(df[args.label_col].unique().tolist())
+    cls2id = {l: i for i, l in enumerate(labels_sorted)}
+    id2label = {i: str(l) for l, i in cls2id.items()}
+    df["labels"] = df[args.label_col].map(cls2id).astype(int)
+    df["text"] = df[args.text_col].astype(str)
+    num_labels = len(cls2id)
+
+    # === NEW/UPDATED ===: 
+    if args.use_struct_tags == "on":
+        print("[INFO] Applying structural tags to texts ...")
+        df["text"] = df["text"].map(lambda s: add_tags_to_text(s, pos=args.struct_pos))
+
+    # ------------------------- Tokenizer & Collator -------------------------
+    tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True, model_max_length=args.max_length)
+    def tok_fn(batch):
+        return tok(batch["text"], truncation=True, max_length=args.max_length)
+    data_collator = DataCollatorWithPadding(tok)
+
+    # ------------------------- BitsAndBytes (optional) -------------------------
+    bnb_cfg = None
+    device_map = None
+    if args.quantize == "8bit" and use_cuda:
+        try:
+            bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
+            device_map = "auto"
+        except Exception:
+            print("[WARN] 8-bit quantization failed, proceeding without it.")
+            bnb_cfg = None
+            device_map = None
+
+    def build_base_model():
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name, num_labels=num_labels,
+            id2label=id2label, label2id=cls2id,
+            quantization_config=bnb_cfg,
+            dtype=torch.float16 if (use_cuda and args.fp16.lower()=="true") else torch.float32,
+            device_map=device_map
+        )
+        if bnb_cfg is not None:
+            try:
+                base_model = prepare_model_for_kbit_training(base_model)
+            except Exception:
+                pass
+        if args.use_lora == "on":
+            target_modules = ["query","key","value"]
+            if "deberta" in args.model_name.lower():
+                target_modules = ["query_proj","key_proj","value_proj"]
+            lora_cfg = LoraConfig(
+                r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                bias="none", task_type="SEQ_CLS", target_modules=target_modules
+            )
+            return get_peft_model(base_model, lora_cfg)
+        else:
+            return base_model
+
+    # ------------------------- Metrics -------------------------
+    accuracy = evaluate.load("accuracy")
+    f1 = evaluate.load("f1")
+    def compute_metrics(p):
+        logits = p.predictions
+        probas = stable_softmax(logits)
+        preds = np.argmax(probas, axis=1)
+        y_true = p.label_ids
+
+        macro_f1 = f1.compute(predictions=preds, references=y_true, average="macro")["f1"]
+        m_auprc = macro_auprc(y_true, probas, num_labels)
+        _, r_pX_macro = recall_at_precision(y_true, probas, args.p_thresh, num_labels)
+        kappa = cohen_kappa_score(y_true, preds)
+        kappa_q = cohen_kappa_score(y_true, preds, weights="quadratic")
+
+        return {
+            "accuracy": accuracy.compute(predictions=preds, references=y_true)["accuracy"],
+            "f1_weighted": f1.compute(predictions=preds, references=y_true, average="weighted")["f1"],
+            "macro_f1": macro_f1,
+            "macro_auprc": m_auprc,
+            f"recall_at_p{int(args.p_thresh*100)}_macro": r_pX_macro,
+            "kappa": kappa,
+            "kappa_quadratic": kappa_q,
+        }
+
+
+
+    # ------------------------- TrainingArguments -------------------------
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        learning_rate=args.lr,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=max(2*args.batch_size, 32),
+        gradient_accumulation_steps=args.grad_accum,
+
+        eval_strategy="steps",  
+        eval_steps=200,
+        logging_steps=50,
+        save_strategy="steps",
+        save_steps=200,
+        save_total_limit=2,
+
+        load_best_model_at_end=True,
+        metric_for_best_model=f"recall_at_p{int(args.p_thresh*100)}_macro",
+        greater_is_better=True,
+
+        fp16=(args.fp16.lower()=="true" and use_cuda),
+        bf16=False,
+        warmup_ratio=0.08,
+        weight_decay=0.01,
+        dataloader_num_workers=0,
+        seed=args.seed,
+        ddp_find_unused_parameters=False
+    )
+
+    callbacks = []
+    if args.early_stop == "on":
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=args.early_patience,
+            early_stopping_threshold=0.0
+        ))
+
+    # ------------------------- Split: 20% independent Test -------------------------
+    trainval_df, test_df = train_test_split(
+        df, test_size=args.test_size, random_state=args.seed, stratify=df["labels"]
+    )
+
+    # Persist or reuse same hold-out split
+    split_dir = os.path.join(args.output_dir, "splits")
+    os.makedirs(split_dir, exist_ok=True)
+    holdout_path = os.path.join(split_dir, "holdout.json")
+
+    if not os.path.exists(holdout_path):
+        json.dump({
+            "seed": args.seed,
+            "test_size": args.test_size,
+            "n_rows": int(len(df)),
+            "test_idx": test_df.index.tolist()
+        }, open(holdout_path, "w"))
+        print(f"[INFO] Saved new hold-out split to {holdout_path}")
+    else:
+        saved = json.load(open(holdout_path))
+        test_idx = saved["test_idx"]
+        test_df  = df.loc[test_idx]
+        trainval_df = df.drop(index=test_idx)
+        assert len(test_df) + len(trainval_df) == len(df)
+        print(f"[INFO] Reusing existing hold-out split from {holdout_path}")
+
+    # Helper: build HF datasets and tokenize
+    def build_ds_tok(df_train, df_val, df_test):
+        ds_local = DatasetDict({
+            "train": Dataset.from_pandas(df_train[["text","labels"]].rename(columns={"labels":"label"}), preserve_index=False),
+            "validation": Dataset.from_pandas(df_val[["text","labels"]].rename(columns={"labels":"label"}), preserve_index=False),
+            "test": Dataset.from_pandas(df_test[["text","labels"]].rename(columns={"labels":"label"}), preserve_index=False),
+        })
+        ds_tok_local = ds_local.map(
+            tok_fn, batched=True,
+            remove_columns=[c for c in ds_local["train"].column_names if c != "label"]
+        )
+        return ds_local, ds_tok_local
+
+    # ------------------------- K-fold CV on 80% pool -------------------------
+    skf = StratifiedKFold(n_splits=args.kfolds, shuffle=True, random_state=args.seed)
+    fold_thresholds, fold_metrics = [], []
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(trainval_df, trainval_df["labels"])):
+        print(f"\n===== Fold {fold+1}/{args.kfolds} =====")
+        tr_df = trainval_df.iloc[tr_idx].reset_index(drop=True)
+        va_df = trainval_df.iloc[va_idx].reset_index(drop=True)
+
+        dsd, ds_tok_fold = build_ds_tok(tr_df, va_df, test_df)
+
+        # === NEW/UPDATED ===:
+        cw = None
+        use_sampler = False
+        if args.imbalance_mode in ["loss", "both"]:
+            cw_np = compute_class_weight("balanced", classes=np.arange(num_labels), y=tr_df["labels"].values)
+            cw = torch.tensor(cw_np, dtype=torch.float32, device=("cuda" if use_cuda else "cpu"))
+        if args.imbalance_mode in ["sampler", "both"]:
+            use_sampler = True
+
+        model_fold = build_base_model()
+        # training_args
+        setattr(training_args, "use_sampler", use_sampler)
+
+        trainer_fold = WeightedTrainer(
+            model=model_fold,
+            args=training_args,
+            train_dataset=ds_tok_fold["train"],
+            eval_dataset=ds_tok_fold["validation"],
+            processing_class=tok,                      
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+            callbacks=callbacks,
+            class_weights=cw,
+        )
+
+        print("Starting training (CV fold)...")
+        trainer_fold.train()
+        print("Fold training finished.")
+        # === NEW: export the best model of this fold ===
+        fold_export_dir = os.path.join(args.output_dir, f"fold{fold+1}_best")
+        export_best_from_trainer(
+            trainer=trainer_fold,
+            ds_val=ds_tok_fold["validation"],
+            export_dir=fold_export_dir,
+            tokenizer=tok,
+            num_labels=num_labels,
+            p_thresh=args.p_thresh,
+            id2label=id2label,
+            label2id=cls2id
+)
+
+        print(f"[INFO] Exported fold-{fold+1} best model to: {fold_export_dir}")
+        eval_val = trainer_fold.evaluate(ds_tok_fold["validation"])
+        print("Fold val metrics:", eval_val)
+
+        # Threshold search on validation
+        pred_val = trainer_fold.predict(ds_tok_fold["validation"])
+        probas_val = stable_softmax(pred_val.predictions)
+        y_val = np.array(dsd["validation"]["label"])
+        thr = find_thresholds_for_precision(y_val, probas_val, args.p_thresh, num_labels)
+        fold_thresholds.append(thr)
+
+        fold_metrics.append({
+            "macro_auprc": float(eval_val.get("eval_macro_auprc", np.nan)),
+            f"recall_at_p{int(args.p_thresh*100)}_macro": float(eval_val.get(f"eval_recall_at_p{int(args.p_thresh*100)}_macro", np.nan)),
+            "macro_f1": float(eval_val.get("eval_macro_f1", np.nan)),
+        })
+
+    thr_avg = np.mean(np.vstack(fold_thresholds), axis=0)
+    print("[INFO] Averaged per-class thresholds for P>=%.2f:" % args.p_thresh,
+          {id2label[i]: float(t) for i, t in enumerate(thr_avg)})
+
+    # ------------------------- Final training on full 80% (no eval) -------------------------
+    print("\n===== Training final model on full 80% and evaluating on 20% Test =====")
+    dsd_full = DatasetDict({
+        "train": Dataset.from_pandas(trainval_df[["text","labels"]].rename(columns={"labels":"label"}), preserve_index=False),
+        "validation": Dataset.from_pandas(trainval_df.sample(0)[["text","labels"]].rename(columns={"labels":"label"}), preserve_index=False), # empty
+        "test": Dataset.from_pandas(test_df[["text","labels"]].rename(columns={"labels":"label"}), preserve_index=False),
+    })
+    ds_tok_full = dsd_full.map(tok_fn, batched=True,
+                               remove_columns=[c for c in dsd_full["train"].column_names if c != "label"])
+
+    final_args = replace(
+        training_args,
+        eval_strategy="no",   
+        save_strategy="no",
+        load_best_model_at_end=False,
+    )
+
+    setattr(final_args, "use_sampler", (args.imbalance_mode in ["sampler","both"]))
+
+
+    final_cw = None
+    if args.imbalance_mode in ["loss","both"]:
+        cw_np_full = compute_class_weight("balanced", classes=np.arange(num_labels), y=trainval_df["labels"].values)
+        final_cw = torch.tensor(cw_np_full, dtype=torch.float32, device=("cuda" if use_cuda else "cpu"))
+
+    final_model = build_base_model()
+    final_trainer = WeightedTrainer(
+        model=final_model,
+        args=final_args,
+        train_dataset=ds_tok_full["train"],
+        eval_dataset=None,
+        processing_class=tok,   
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        class_weights=final_cw,
+    )
+    final_trainer.train()
+
+    # ------------------------- Evaluate on independent Test -------------------------
+    pred_test = final_trainer.predict(ds_tok_full["test"])
+    logits_test = pred_test.predictions
+    probas_test = stable_softmax(logits_test)
+    y_test = np.array(dsd_full["test"]["label"])
+    texts_test = list(dsd_full["test"]["text"])
+
+    # Argmax metrics (reference)
+    # Argmax metrics (reference)
+    pred_top1 = np.argmax(probas_test, axis=1)
+    kappa_test = cohen_kappa_score(y_test, pred_top1)
+    kappa_q_test = cohen_kappa_score(y_test, pred_top1, weights="quadratic")
+
+    # AUPRC & recall@precision (your existing high-precision objective)
+    m_auprc_test = macro_auprc(y_test, probas_test, num_labels)
+    _, r_pX_macro_test = recall_at_precision(y_test, probas_test, args.p_thresh, num_labels)
+
+    # Core classification metrics
+    acc_test = accuracy_score(y_test, pred_top1)
+    p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
+        y_test, pred_top1, average="macro", zero_division=0
+    )
+    p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        y_test, pred_top1, average="weighted", zero_division=0
+    )
+
+    # Keep your previous name for macro F1 to avoid breaking downstream code
+    m_f1_test = f1_macro
+
+    print(
+    "\n[TEST] "
+    f"Accuracy: {acc_test:.6f} | "
+    f"Precision(macro): {p_macro:.6f} | Recall(macro): {r_macro:.6f} | F1(macro): {f1_macro:.6f} | "
+    f"Precision(weighted): {p_weighted:.6f} | Recall(weighted): {r_weighted:.6f} | F1(weighted): {f1_weighted:.6f} | "
+    f"Kappa: {kappa_test:.6f} | Kappa(quadratic): {kappa_q_test:.6f} | "
+    f"Macro AUPRC: {m_auprc_test:.6f} | Recall@P>={args.p_thresh:.2f} (macro): {r_pX_macro_test:.6f}"
+)
+
+
+
+    print("\n[TEST] Macro AUPRC: %.6f | Recall@P>=%.2f (macro): %.6f | Macro-F1: %.6f"
+          % (m_auprc_test, args.p_thresh, r_pX_macro_test, m_f1_test))
+
+    # Thresholded (high-precision) predictions on Test
+    pred_bin = (probas_test >= thr_avg[None, :]).astype(int)
+    for i in range(len(pred_bin)):
+        if pred_bin[i].sum() == 0:
+            pred_bin[i, pred_top1[i]] = 1
+
+    # ------------------------- Save artifacts & CSVs -------------------------
+    os.makedirs(args.output_dir, exist_ok=True)
+    metrics_dir = os.path.join(args.output_dir, "metrics_exports")
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    # id2label JSON
+    id2label_path = os.path.join(args.output_dir, "id2label.json")
+    with open(id2label_path, "w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in id2label.items()}, f, ensure_ascii=False, indent=2)
+
+    # Save CV summary & thresholds
+    with open(os.path.join(args.output_dir, "cv_fold_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(fold_metrics, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(args.output_dir, "thresholds_avg.json"), "w", encoding="utf-8") as f:
+        json.dump({id2label[i]: float(t) for i, t in enumerate(thr_avg)}, f, ensure_ascii=False, indent=2)
+
+    # Per-class PR curve points on Test
+    y_bin_test = label_binarize(y_test, classes=np.arange(num_labels))
+    with open(os.path.join(metrics_dir, "per_class_pr_curves_test.csv"), "w", newline="", encoding="utf-8") as f:
+        import csv
+        writer = csv.writer(f)
+        writer.writerow(["class_id", "class_name", "threshold_index", "precision", "recall"])
+        for c in range(num_labels):
+            precision, recall, _ = precision_recall_curve(y_bin_test[:, c], probas_test[:, c])
+            for i in range(len(precision)):
+                writer.writerow([c, id2label[c], i, float(precision[i]), float(recall[i])])
+
+
+        # === NEW/UPDATED ===:
+        per_p, per_r, per_f1, _ = precision_recall_fscore_support(y_test, pred_top1, labels=np.arange(num_labels), zero_division=0)
+        with open(os.path.join(metrics_dir, "per_class_prf_test.csv"), "w", newline="", encoding="utf-8") as f:
+            import csv
+            w = csv.writer(f); w.writerow(["class_id","class_name","precision","recall","f1"])
+            for c in range(num_labels):
+                w.writerow([c, id2label[c], float(per_p[c]), float(per_r[c]), float(per_f1[c])])
+
+    # Summary macro metrics on Test
+    # Summary test metrics (accuracy + macro & weighted)
+    with open(os.path.join(metrics_dir, "summary_macro_metrics_test.csv"), "w", newline="", encoding="utf-8") as f:
+        import csv
+        writer = csv.writer(f)
+        writer.writerow([
+            "accuracy",
+            "precision_macro", "recall_macro", "macro_f1",
+            "precision_weighted", "recall_weighted", "f1_weighted",
+            "kappa", "kappa_quadratic",
+            "macro_auprc", f"recall_at_p{int(args.p_thresh*100)}_macro"
+])
+        writer.writerow([
+    acc_test,
+    p_macro, r_macro, m_f1_test,
+    p_weighted, r_weighted, f1_weighted,
+    kappa_test, kappa_q_test,
+    m_auprc_test, r_pX_macro_test
+])
+
+
+    # Ranked outputs (argmax confidence) on Test
+    pred_conf = probas_test[np.arange(len(pred_top1)), pred_top1]
+    rows = []
+    for i in range(len(texts_test)):
+        row = {
+            "text": texts_test[i],
+            "true_label": id2label[y_test[i]],
+            "pred_label": id2label[pred_top1[i]],
+            "pred_conf": float(pred_conf[i]),
+        }
+        for c in range(num_labels):
+            row[f"p({id2label[c]})"] = float(probas_test[i, c])
+        rows.append(row)
+    rows.sort(key=lambda r: r["pred_conf"], reverse=True)
+    cols = ["text", "true_label", "pred_label", "pred_conf"] + [f"p({id2label[c]})" for c in range(num_labels)]
+    with open(os.path.join(metrics_dir, "test_predictions_ranked.csv"), "w", newline="", encoding="utf-8") as f:
+        import csv
+        writer = csv.DictWriter(f, fieldnames=cols); writer.writeheader()
+        for r in rows: writer.writerow(r)
+
+    # Thresholded (high-precision-oriented) predictions CSV on Test
+    with open(os.path.join(metrics_dir, "test_predictions_thresholded_pX.csv"), "w", newline="", encoding="utf-8") as f:
+        import csv
+        writer = csv.writer(f)
+        hdr = ["text", "true_label", "argmax_label"] + [f"pred_{id2label[c]}(>=thr?)" for c in range(num_labels)] + \
+              [f"p({id2label[c]})" for c in range(num_labels)]
+        writer.writerow(hdr)
+        for i in range(len(texts_test)):
+            row = [texts_test[i], id2label[y_test[i]], id2label[pred_top1[i]]] + \
+                  pred_bin[i].astype(int).tolist() + list(map(float, probas_test[i]))
+            writer.writerow(row)
+
+    # Save PEFT model/tokenizer
+    peft_dir = os.path.join(args.output_dir, "model_peft")
+    final_trainer.save_model(peft_dir)
+    tok.save_pretrained(peft_dir)
+
+
+    # === NEW: standard single-folder export for deployment ===
+    final_export = os.path.join(args.output_dir, "final_export")
+    os.makedirs(final_export, exist_ok=True)
+    final_trainer.model.save_pretrained(final_export)
+    tok.save_pretrained(final_export)
+    with open(os.path.join(final_export, "id2label.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in id2label.items()}, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] Final model exported to: {final_export}")
+
+
+    # Optionally merge LoRA for deployment
+    if args.save_merged == "on" and args.use_lora == "on":
+        try:
+            merged = final_trainer.model.merge_and_unload()
+            save_dir = os.path.join(args.output_dir, "model_merged")
+            os.makedirs(save_dir, exist_ok=True)
+            merged.save_pretrained(save_dir)
+            tok.save_pretrained(save_dir)
+            pd.Series(id2label).to_json(os.path.join(save_dir, "id2label.json"))
+            print(f"Merged model saved to: {save_dir}")
+        except Exception as e:
+            print("Merge LoRA failed:", e)
+
+    # === NEW/UPDATED ===: 
+    if args.use_struct_tags=="on" and args.export_tag_summary=="on":
+        print("[INFO] Exporting structural tag summary ...")
+        def extract_tags(s: str):
+            return [tok for tok in s.split() if tok.startswith("[") and tok.endswith("]")]
+        from collections import Counter as Cnt
+        tag_cnt = Cnt()
+        for s in pd.concat([trainval_df["text"], test_df["text"]]).astype(str):
+            for t in extract_tags(s):
+                tag_cnt[t]+=1
+        tag_df = pd.DataFrame(sorted(tag_cnt.items(), key=lambda x: x[1], reverse=True), columns=["tag","count"])
+        tag_df.to_csv(os.path.join(args.output_dir, "tag_summary_all.csv"), index=False)
+
+    # Summary JSON
+    train_counts_py = {int(k): int(v) for k, v in Counter(trainval_df["labels"].tolist()).items()}
+    summary = {
+        "model": args.model_name,
+        "max_length": args.max_length,
+        "lr": args.lr,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "seed": args.seed,
+        "class_weight": args.class_weight,
+        "quantize": args.quantize,
+        "use_lora": args.use_lora,
+        "kfolds": args.kfolds,
+        "p_thresh": args.p_thresh,
+        "num_labels": num_labels,
+        "trainval_counts": train_counts_py,
+        "test_size": args.test_size,
+        "test_macro_auprc": m_auprc_test,
+        f"test_recall_at_p{int(args.p_thresh*100)}_macro": r_pX_macro_test,
+        "test_macro_f1": m_f1_test,
+        "imbalance_mode": args.imbalance_mode,
+        "use_struct_tags": args.use_struct_tags,
+        "struct_pos": args.struct_pos,
+        "shap_sample": args.shap_sample,
+        "test_accuracy": acc_test,
+        "test_precision_macro": p_macro,
+        "test_recall_macro": r_macro,
+        "test_f1_weighted": f1_weighted,
+        "test_precision_weighted": p_weighted,
+        "test_recall_weighted": r_weighted,
+        "test_kappa": kappa_test,
+        "test_kappa_quadratic": kappa_q_test,
+
+
+    }
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(json.dumps(summary, indent=2))
+
+if __name__ == "__main__":
+    main()
